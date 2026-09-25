@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vault34</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <header class="brand">
+      <div class="logo">34</div>
+      <div>
+        <h1>Vault34</h1>
+        <p class="sub">offline media index</p>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-view="library">Library</button>
+      <button class="tab" data-view="duplicates">Duplicates</button>
+    </nav>
+
+    <section class="panel" id="filters">
+      <label class="field">
+        <span>Search</span>
+        <div class="search-wrap">
+          <input id="q" type="search" placeholder="tag, word or filename..." autocomplete="off">
+          <div class="ac" id="ac" hidden></div>
+        </div>
+      </label>
+
+      <div class="chips" id="active-tags"></div>
+
+      <div class="row">
+        <label class="field grow">
+          <span>Kind</span>
+          <select id="kind">
+            <option value="">All media</option>
+            <option value="image">Images</option>
+            <option value="video">Videos</option>
+          </select>
+        </label>
+        <label class="field grow">
+          <span>Sort</span>
+          <select id="sort">
+            <option value="recent">Newest indexed</option>
+            <option value="added">Recently added</option>
+            <option value="relevance">Tag relevance</option>
+            <option value="name">Filename</option>
+            <option value="size">File size</option>
+          </select>
+        </label>
+      </div>
+
+      <label class="field">
+        <span>Min. confidence <b id="conf-value">0%</b></span>
+        <input id="conf" type="range" min="0" max="90" step="5" value="0">
+      </label>
+    </section>
+
+    <section class="panel">
+      <h2>Top tags</h2>
+      <div class="chips" id="top-tags"></div>
+    </section>
+
+    <footer class="sidefoot">
+      <div id="stats" class="stats"></div>
+      <div class="actions">
+        <button id="scan" class="btn">Rescan inbox</button>
+        <button id="open-inbox" class="btn ghost" title="Open the watched folder">inbox</button>
+      </div>
+    </footer>
+  </aside>
+
+  <main class="main">
+    <header class="toolbar">
+      <div class="crumbs" id="crumbs">All media</div>
+      <div class="grow"></div>
+      <div class="progress" id="progress" hidden>
+        <div class="bar"><div class="fill" id="progress-fill"></div></div>
+        <span id="progress-text"></span>
+      </div>
+      <span class="count" id="count"></span>
+    </header>
+
+    <div class="scroller" id="scroller">
+      <div class="grid" id="grid"></div>
+      <div class="empty" id="empty" hidden></div>
+    </div>
+
+    <div class="loadmore"><button id="more" class="btn" hidden>Load more</button></div>
+  </main>
+
+</div>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="close" id="lb-close">&times;</button>
+  <figure>
+    <img id="lb-img" alt="">
+    <figcaption>
+      <h3 id="lb-title"></h3>
+      <p id="lb-meta" class="mono"></p>
+      <div class="chips" id="lb-tags"></div>
+      <div class="lb-actions">
+        <button id="lb-reveal" class="btn ghost">Show in folder</button>
+      </div>
+    </figcaption>
+  </figure>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

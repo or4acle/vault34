@@ -1,0 +1,192 @@
+:root {
+  --bg: #0e1014;
+  --panel: #151821;
+  --panel-2: #1b1f2a;
+  --line: #262b38;
+  --text: #e6e9f0;
+  --muted: #8b93a7;
+  --accent: #6ea8fe;
+  --accent-2: #a78bfa;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --radius: 10px;
+  --thumb: 190px;
+}
+
+* { box-sizing: border-box; }
+
+/* Author styles beat the UA stylesheet, so any rule with `display` silently
+   defeats the `hidden` attribute. Without this, `.lightbox { display: grid }`
+   keeps the full-screen overlay permanently on top of the app. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+  overflow: hidden;
+}
+
+.mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px; }
+
+.app { display: flex; height: 100%; }
+
+/* ---------- sidebar ---------- */
+.sidebar {
+  width: 320px;
+  flex: 0 0 320px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.brand { display: flex; gap: 12px; align-items: center; padding: 18px 18px 12px; }
+.logo {
+  width: 38px; height: 38px; border-radius: 9px;
+  background: linear-gradient(140deg, var(--accent), var(--accent-2));
+  color: #0b0d12; font-weight: 800; font-size: 15px;
+  display: grid; place-items: center;
+}
+.brand h1 { margin: 0; font-size: 16px; letter-spacing: .2px; }
+.sub { margin: 0; color: var(--muted); font-size: 11.5px; }
+
+.tabs { display: flex; gap: 6px; padding: 0 18px 14px; }
+.tab {
+  flex: 1; padding: 7px 10px; border-radius: 8px; cursor: pointer;
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--line); font-size: 12.5px;
+}
+.tab.active { background: var(--accent); color: #0b0d12; border-color: var(--accent); font-weight: 600; }
+
+.panel { padding: 0 18px 16px; }
+.panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .9px; color: var(--muted); margin: 4px 0 10px; }
+
+.field { display: block; margin-bottom: 12px; }
+.field > span { display: block; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+.row { display: flex; gap: 10px; }
+.row .field { flex: 1; }
+.grow { flex: 1; }
+
+input[type="search"], input[type="text"], select {
+  width: 100%; padding: 8px 10px; border-radius: 8px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); font-size: 13px; outline: none;
+}
+input[type="search"]:focus, select:focus { border-color: var(--accent); }
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+
+.search-wrap { position: relative; }
+.ac {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 40;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; max-height: 260px; overflow-y: auto;
+  box-shadow: 0 12px 30px rgba(0,0,0,.5);
+}
+.ac div { padding: 7px 10px; cursor: pointer; font-size: 12.5px; display: flex; justify-content: space-between; gap: 8px; }
+.ac div:hover, .ac div.sel { background: var(--accent); color: #0b0d12; }
+.ac small { color: var(--muted); }
+.ac div:hover small, .ac div.sel small { color: #0b0d12; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  padding: 4px 9px; border-radius: 999px; font-size: 11.5px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  cursor: pointer; white-space: nowrap;
+}
+.chip:hover { border-color: var(--accent); }
+.chip.on { background: var(--accent); color: #0b0d12; border-color: var(--accent); font-weight: 600; }
+.chip .x { opacity: .6; margin-left: 5px; }
+.chip.cat-character { border-style: dashed; }
+.chip.n { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 10.5px; }
+
+.sidefoot { margin-top: auto; padding: 14px 18px 18px; border-top: 1px solid var(--line); }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; font-size: 11.5px; color: var(--muted); margin-bottom: 10px; }
+.stats b { color: var(--text); font-weight: 600; }
+.actions { display: flex; gap: 8px; }
+
+.btn {
+  padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 12.5px;
+  background: var(--accent); color: #0b0d12; border: 1px solid var(--accent); font-weight: 600;
+}
+.btn.ghost { background: var(--panel-2); color: var(--text); border-color: var(--line); font-weight: 500; }
+.btn:hover { filter: brightness(1.08); }
+.btn:disabled { opacity: .5; cursor: default; }
+
+/* ---------- main ---------- */
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+.toolbar {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.crumbs { font-size: 13px; color: var(--muted); }
+.crumbs b { color: var(--text); }
+.count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+.progress { display: flex; align-items: center; gap: 8px; }
+.bar { width: 140px; height: 5px; background: var(--panel-2); border-radius: 999px; overflow: hidden; }
+.fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .25s; }
+#progress-text { font-size: 11.5px; color: var(--muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.scroller { flex: 1; overflow-y: auto; padding: 16px 18px 8px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--thumb), 1fr)); gap: 14px; }
+
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  overflow: hidden; cursor: pointer; display: flex; flex-direction: column;
+  transition: transform .12s ease, border-color .12s ease;
+}
+.card:hover { transform: translateY(-2px); border-color: var(--accent); }
+.card .thumb {
+  aspect-ratio: 1; background: var(--panel-2); position: relative;
+  display: grid; place-items: center; overflow: hidden;
+}
+.card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.card .meta { padding: 8px 10px 10px; }
+.card .name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.card .tags span {
+  font-size: 10px; padding: 2px 6px; border-radius: 999px;
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--line);
+}
+.badge {
+  position: absolute; top: 7px; left: 7px; z-index: 2;
+  font-size: 10px; padding: 2px 7px; border-radius: 999px;
+  background: rgba(0,0,0,.65); color: #fff; backdrop-filter: blur(4px);
+}
+.badge.dup { background: rgba(251,191,36,.9); color: #20170a; font-weight: 700; }
+
+.empty { padding: 60px 20px; text-align: center; color: var(--muted); }
+.loadmore { padding: 12px; text-align: center; border-top: 1px solid var(--line); }
+
+.dupgroup { margin-bottom: 26px; }
+.dupgroup h3 { font-size: 12px; color: var(--muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: .8px; }
+
+/* ---------- lightbox ---------- */
+.lightbox {
+  position: fixed; inset: 0; z-index: 100; background: rgba(6,8,12,.92);
+  display: grid; place-items: center; padding: 30px; backdrop-filter: blur(3px);
+}
+.lightbox figure {
+  margin: 0; display: flex; gap: 20px; max-width: 1200px; max-height: 90vh;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+}
+.lightbox img { max-width: 66vw; max-height: 88vh; object-fit: contain; display: block; background: #000; }
+.lightbox figcaption { padding: 18px; width: 320px; overflow-y: auto; }
+.lightbox h3 { margin: 0 0 6px; font-size: 14px; word-break: break-word; }
+.lightbox .mono { color: var(--muted); margin: 0 0 14px; word-break: break-all; }
+.lb-actions { margin-top: 14px; }
+.close {
+  position: absolute; top: 16px; right: 20px; background: none; border: none;
+  color: var(--text); font-size: 30px; cursor: pointer; line-height: 1;
+}
+
+@media (max-width: 860px) {
+  .sidebar { width: 250px; flex-basis: 250px; }
+  .lightbox figure { flex-direction: column; }
+  .lightbox figcaption { width: auto; }
+}
