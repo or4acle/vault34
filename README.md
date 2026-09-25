@@ -11,9 +11,6 @@
 <!-- PROJECT LOGO -->
 <br />
 <div align="center">
-  <a href="#about-the-project">
-    <img src="images/logo.png" alt="Vault34 logo" width="88" height="88">
-  </a>
 
   <h3 align="center">Vault34</h3>
 
@@ -203,7 +200,7 @@ Free text matches filenames and tags through FTS5.
 1. **Install dependencies**
 
    ```sh
-   git clone https://github.com/your_username/vault34.git
+   git clone https://github.com/or4acle/vault34.git
    cd vault34
    python -m pip install -r requirements.txt
    ```
@@ -473,14 +470,14 @@ this repository.
 <br />
 
 <!-- MARKDOWN LINKS & IMAGES -->
-[contributors-shield]: https://img.shields.io/github/contributors/your_username/vault34.svg?style=for-the-badge
-[contributors-url]: https://github.com/your_username/vault34/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/your_username/vault34.svg?style=for-the-badge
-[forks-url]: https://github.com/your_username/vault34/network/members
-[stars-shield]: https://img.shields.io/github/stars/your_username/vault34.svg?style=for-the-badge
-[stars-url]: https://github.com/your_username/vault34/stargazers
-[issues-shield]: https://img.shields.io/github/issues/your_username/vault34.svg?style=for-the-badge
-[issues-url]: https://github.com/your_username/vault34/issues
-[license-shield]: https://img.shields.io/github/license/your_username/vault34.svg?style=for-the-badge
-[license-url]: https://github.com/your_username/vault34/blob/main/LICENSE.txt
+[contributors-shield]: https://img.shields.io/github/contributors/or4acle/vault34.svg?style=for-the-badge
+[contributors-url]: https://github.com/or4acle/vault34/graphs/contributors
+[forks-shield]: https://img.shields.io/github/forks/or4acle/vault34.svg?style=for-the-badge
+[forks-url]: https://github.com/or4acle/vault34/network/members
+[stars-shield]: https://img.shields.io/github/stars/or4acle/vault34.svg?style=for-the-badge
+[stars-url]: https://github.com/or4acle/vault34/stargazers
+[issues-shield]: https://img.shields.io/github/issues/or4acle/vault34.svg?style=for-the-badge
+[issues-url]: https://github.com/or4acle/vault34/issues
+[license-shield]: https://img.shields.io/github/license/or4acle/vault34.svg?style=for-the-badge
+[license-url]: https://github.com/or4acle/vault34/blob/main/LICENSE.txt
 [product-screenshot]: images/screenshot.png
