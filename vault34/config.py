@@ -44,10 +44,15 @@ def _env(key: str, cast=str):
         return None
     if cast is bool:
         return raw.strip().lower() in {"1", "true", "yes", "on"}
-    if cast is int:
-        return int(raw)
-    if cast is float:
-        return float(raw)
+    if cast in (int, float):
+        try:
+            return cast(raw.strip())
+        except ValueError:
+            # A typo in the environment must not take the whole app down; the
+            # default is used instead and the mistake is reported.
+            print(f"[config] VAULT34_{key.upper()}={raw!r} is not a "
+                  f"{cast.__name__}, using the default")
+            return None
     return raw
 
 
@@ -151,7 +156,7 @@ class Config:
         return data
 
 
-def _cast(key: str, value):
+def _cast(key: str):
     default = DEFAULTS.get(key)
     if isinstance(default, bool):
         return _env(key, bool)
@@ -168,8 +173,48 @@ def _cast(key: str, value):
     return _env(key)
 
 
+# Keys ``config.json`` is allowed to set. Restricting this matters because
+# ``hasattr`` is true for read-only properties such as ``db_path``, so an
+# unvalidated ``{"db_path": ...}`` raised AttributeError and killed startup.
+CONFIGURABLE = frozenset(DEFAULTS) | {"inbox_dir", "library_dir"}
+
+# Guard rails for the tunables that would otherwise wedge the pipeline.
+BOUNDS = {
+    "general_threshold": (0.01, 1.0),
+    "character_threshold": (0.01, 1.0),
+    "max_tags": (1, 1000),
+    "max_phash_distance": (0, 64),
+    "max_dhash_distance": (0, 64),
+    "thumb_size": (32, 4096),
+    "stability_checks": (1, 100),
+    "stability_interval": (0.05, 60.0),
+    "port": (0, 65535),
+    "window_width": (640, 16384),
+    "window_height": (480, 16384),
+}
+
+
+def _clamp(key: str, value):
+    bounds = BOUNDS.get(key)
+    if not bounds or not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    low, high = bounds
+    if value < low:
+        print(f"[config] {key}={value} is below {low}, clamping")
+        return low
+    if value > high:
+        print(f"[config] {key}={value} is above {high}, clamping")
+        return high
+    return value
+
+
 def load_config(root: Path | None = None) -> Config:
-    """Build the config from defaults, ``config.json`` and the environment."""
+    """Build the config from defaults, ``config.json`` and the environment.
+
+    Precedence is defaults < config.json < environment, and every layer is
+    tolerated when malformed: a hand-edited config should degrade to the
+    defaults, never prevent the app from starting.
+    """
     cfg = Config()
     if root is not None:
         cfg.root = Path(root).resolve()
@@ -177,19 +222,27 @@ def load_config(root: Path | None = None) -> Config:
     json_path = cfg.root / "config.json"
     if json_path.is_file():
         try:
-            for key, value in json.loads(json_path.read_text(encoding="utf-8")).items():
-                if hasattr(cfg, key):
-                    setattr(cfg, key, value)
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             print(f"[config] ignoring unreadable {json_path.name}: {exc}")
+            payload = {}
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key not in CONFIGURABLE:
+                    print(f"[config] ignoring unknown key {key!r} in config.json")
+                    continue
+                try:
+                    setattr(cfg, key, _clamp(key, value))
+                except (AttributeError, TypeError, ValueError) as exc:
+                    print(f"[config] ignoring {key!r}: {exc}")
 
     for key in DEFAULTS:
-        override = _cast(key, getattr(cfg, key))
+        override = _cast(key)
         if override is None:
             continue
         if isinstance(override, list) and not override:
             continue      # don't let an empty env value wipe config.json
-        setattr(cfg, key, override)
+        setattr(cfg, key, _clamp(key, override))
 
     cfg.root = Path(cfg.root).resolve()
     cfg.ensure_dirs()

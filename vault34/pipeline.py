@@ -21,8 +21,8 @@ from PIL import Image
 
 from .config import Config
 from .hashing import (DuplicateMatcher, perceptual_hashes, sha256_file)
-from .media import (classify, find_ffmpeg, make_thumbnail, open_for_tagging,
-                    probe_image, probe_video)
+from .media import (classify, find_ffmpeg, first_frame, make_thumbnail,
+                    open_for_tagging, probe_image, probe_video)
 from .db import Database
 
 
@@ -51,7 +51,7 @@ class Pipeline:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.RLock()
-        self._busy = False
+        self._inflight = 0
         self.progress = Progress(phase="idle")
         self._listeners: list = []
         self.matcher = DuplicateMatcher(cfg.max_phash_distance, cfg.max_dhash_distance)
@@ -74,9 +74,27 @@ class Pipeline:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
+        """Stop the worker, returning anything still queued to the retry table.
+
+        Items left in the in-memory queue used to vanish on exit, so a quit
+        during a long ingest silently lost that work. Persisting them means the
+        next launch picks them back up.
+        """
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=timeout)
+        stranded = 0
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._queue.task_done()
+            if item is not None:
+                self.db.requeue(item, "interrupted by shutdown")
+                stranded += 1
+        if stranded:
+            print(f"[pipeline] {stranded} item(s) deferred to the next launch")
 
     def submit(self, path: str | Path) -> None:
         self._queue.put(str(path))
@@ -94,12 +112,12 @@ class Pipeline:
         test harness) rely on this to know when ingest has actually settled.
         """
         with self._lock:
-            return self._queue.qsize() + (1 if self._busy else 0)
+            return self._queue.qsize() + self._inflight
 
     @property
     def busy(self) -> bool:
         with self._lock:
-            return self._busy
+            return self._inflight > 0
 
     def wait_until_idle(self, timeout: float | None = None) -> bool:
         """Block until the queue is empty and no item is in flight."""
@@ -133,21 +151,26 @@ class Pipeline:
             try:
                 item = self._queue.get(timeout=0.3)
             except queue.Empty:
-                self._emit(phase="idle" if self.progress.phase != "idle" else "idle")
+                self._emit(phase="idle")
                 continue
             if item is None:
                 self._queue.task_done()
                 break
+            # The in-flight counter is raised in the same breath as the dequeue
+            # becoming visible. Setting it a statement later left a window where
+            # qsize() had already dropped and the counter had not been raised,
+            # so `pending` briefly read 0 and wait_until_idle() returned while
+            # the file was still being tagged.
+            with self._lock:
+                self._inflight += 1
             try:
-                with self._lock:
-                    self._busy = True
                 self.process(item)
             except Exception as exc:  # noqa: BLE001
                 self._emit(last_error=f"{item}: {exc}")
                 self.db.requeue(item, str(exc))
             finally:
                 with self._lock:
-                    self._busy = False
+                    self._inflight -= 1
                 self._queue.task_done()
 
     # -- single file ----------------------------------------------------
@@ -163,8 +186,20 @@ class Pipeline:
             return None
 
         stat = path.stat()
-        info = probe_image(path) if kind == "image" else probe_video(path, self.ffmpeg)
-        sha = sha256_file(path)
+        try:
+            info = probe_image(path) if kind == "image" else probe_video(path, self.ffmpeg)
+            sha = sha256_file(path)
+        except Exception as exc:  # noqa: BLE001
+            # An unreadable file used to raise out of the worker and land back
+            # in the retry table forever. Record it as a failure so it is
+            # visible in the UI and stops being retried on every launch.
+            message = f"{type(exc).__name__}: {exc}"
+            self._emit(last_error=f"cannot read {path.name}: {exc}")
+            self.db.upsert_media(
+                path=str(path), filename=path.name, ext=path.suffix.lower(),
+                kind=kind, file_size=stat.st_size, mtime=stat.st_mtime,
+                status="error", error=message[:500])
+            return {"id": None, "status": "error", "error": message}
 
         thumb_rel = f"{path.stem}_{sha[:8]}.jpg"
         thumb_abs = self.cfg.thumbs_dir / thumb_rel
@@ -178,8 +213,7 @@ class Pipeline:
         try:
             if kind == "image":
                 with Image.open(path) as handle:
-                    handle.seek(0)
-                    phash, dhash = perceptual_hashes(handle.convert("RGB"))
+                    phash, dhash = perceptual_hashes(first_frame(handle))
             else:
                 frame = open_for_tagging(path, kind, self.ffmpeg)
                 phash, dhash = perceptual_hashes(frame)
@@ -203,7 +237,7 @@ class Pipeline:
                 width=info.width, height=info.height, duration=info.duration,
                 sha256=sha, phash=phash, dhash=dhash, thumb=None,
                 status="duplicate", duplicate_of=match["id"],
-                error=f"{how} duplicate of #{match['id']}")
+                error=f"{how} duplicate of #{match['id']}", tags=[])
             self._emit(phase="processing", current=path.name,
                        completed=self.progress.completed + 1)
             return {"id": media_id, "status": "duplicate", "match": match, "how": how}
@@ -248,11 +282,11 @@ class Pipeline:
 
         media_id = self.db.upsert_media(
             path=str(path), filename=path.name, ext=path.suffix.lower(), kind=kind,
-            animated=int(info.animated), file_size=path.stat().st_size,
+            animated=int(info.animated), file_size=stat.st_size,
             mtime=stat.st_mtime, width=info.width, height=info.height,
             duration=info.duration, sha256=sha, phash=phash, dhash=dhash,
             rating=rating, thumb=thumb_rel if thumb_ok else None,
-            status="ready", indexed_at=time.time(), tags=tags or None)
+            status="ready", indexed_at=time.time(), tags=tags)
 
         self.matcher.add(sha, phash, dhash,
                          {"id": media_id, "path": str(path)})
@@ -297,14 +331,31 @@ class Pipeline:
 
     # -- bulk -----------------------------------------------------------
     def scan_inbox(self) -> int:
+        """Queue every media file in the inbox that is not already indexed.
+
+        Skipping known paths is what keeps ``organize=False`` from looping: the
+        file never leaves the inbox, so a rescan used to re-index it forever.
+        """
         from .config import IMAGE_EXT, VIDEO_EXT
         found = 0
         if not self.cfg.inbox_dir.is_dir():
             return 0
         for path in sorted(self.cfg.inbox_dir.rglob("*")):
-            if path.is_file() and not path.name.startswith(".") \
-                    and path.suffix.lower() in (IMAGE_EXT | VIDEO_EXT):
-                self.submit(path)
-                found += 1
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            if path.suffix.lower() not in (IMAGE_EXT | VIDEO_EXT):
+                continue
+            if self.db.get_by_path(str(path)):
+                continue
+            self.submit(path)
+            found += 1
         self._emit(total=self.pending)
         return found
+
+    def resume_failures(self, max_tries: int = 5) -> int:
+        """Re-queue paths that failed during an earlier run."""
+        paths = self.db.retry_paths(max_tries=max_tries)
+        alive = [p for p in paths if Path(p).is_file()]
+        for path in alive:
+            self.submit(path)
+        return len(alive)

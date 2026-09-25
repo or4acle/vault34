@@ -164,7 +164,10 @@ def main() -> int:
     check("watcher detected the new file", picked,
           f"stats {before} -> {db.stats()['total']}")
 
-    # partially-written file must not be processed early
+    # A file still being written must not be indexed until it settles. The
+    # test deliberately corrupts it, so "settled" can only mean "recorded as
+    # an explicit error, never as ready" - silently dropping the row (the old
+    # behaviour) would also satisfy a naive check and hide the corruption.
     partial = cfg.inbox_dir / "slow_write.png"
     with open(partial, "wb") as handle:
         im.save(handle, "PNG")
@@ -172,11 +175,15 @@ def main() -> int:
             handle.flush()
             time.sleep(0.4)
             with open(partial, "r+b") as grow:
-                grow.write(b"\x00" * 64)
-    time.sleep(2)
-    rows = [r for r in db._query("SELECT filename, status FROM media")]
-    bad = [r for r in rows if r["filename"] == "slow_write.png" and r["status"] != "ready"]
-    check("slow write settled before processing", not bad, f"{len(rows)} rows")
+                grow.write(b"\x00" * 64)   # clobbers the PNG signature
+    time.sleep(2.5)
+    rows = [dict(r) for r in db._query(
+        "SELECT filename, status, error FROM media WHERE filename='slow_write.png'")]
+    check("a corrupt slow write is never indexed as ready",
+          rows and all(r["status"] == "error" for r in rows),
+          f"rows={rows}")
+    check("and the corruption is reported, not swallowed",
+          all(r["error"] for r in rows), f"rows={rows}")
 
     check("scan endpoint", post("/api/scan").get("status") == "queued")
     check("progress endpoint", "phase" in get("/api/progress"))

@@ -16,7 +16,9 @@ import threading
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+# 4: queue.path became unique, so a rescan no longer piles up one row per event
+# for the same file.
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -75,7 +77,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE TABLE IF NOT EXISTS queue (
     id       INTEGER PRIMARY KEY,
-    path     TEXT NOT NULL,
+    path     TEXT NOT NULL UNIQUE,
     added_at REAL NOT NULL,
     tries    INTEGER NOT NULL DEFAULT 0,
     error    TEXT
@@ -99,16 +101,50 @@ class Database:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
-        try:
-            self._conn.executescript(FTS_SCHEMA)
-        except sqlite3.OperationalError:
-            pass  # FTS5 unavailable: free-text search degrades to LIKE
+        self._migrate()
+        self.has_fts = self._create_fts()
         self._conn.execute(
             "INSERT INTO settings(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring an older database up to the current shape.
+
+        ``queue.path`` used to be a plain column, which made the ``ON CONFLICT
+        DO NOTHING`` in :meth:`enqueue` a no-op and let the same file pile up
+        once per rescan. The table needs a unique index, and adding one to a
+        table that already holds duplicates means collapsing them first.
+        """
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_path ON queue(path)")
+                self._conn.commit()
+                return
+            except sqlite3.IntegrityError:
+                pass          # duplicates present: collapse them first
+            except sqlite3.OperationalError:
+                return         # no queue table at all
+            # Keep one row per path, retaining the most recent attempt.
+            rows = self._conn.execute(
+                "SELECT path, MAX(added_at) AS ts FROM queue GROUP BY path").fetchall()
+            self._conn.execute("DELETE FROM queue")
+            self._conn.executemany(
+                "INSERT INTO queue(path, added_at) VALUES(?, ?)",
+                [(r["path"], r["ts"]) for r in rows])
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_path ON queue(path)")
+            self._conn.commit()
+
+    def _create_fts(self) -> bool:
+        try:
+            self._conn.executescript(FTS_SCHEMA)
+            return True
+        except sqlite3.OperationalError:
+            return False     # FTS5 unavailable: free-text search falls back to LIKE
 
     # -- plumbing -------------------------------------------------------
     @property
@@ -152,6 +188,7 @@ class Database:
 
         ``tags`` may be supplied as a list of ``(name, category, confidence)``
         which is written to the normalised tag tables in the same transaction.
+        Pass ``tags=[]`` to clear the tags a previous run produced.
         """
         tags = fields.pop("tags", None)
         allowed = {
@@ -166,12 +203,13 @@ class Database:
             data["path"] = str(data["path"])
         if data.get("thumb") is not None:
             data["thumb"] = str(data["thumb"])
-        data.setdefault("added_at", time.time())
         if data.get("status") == "ready" and "indexed_at" not in data:
             data["indexed_at"] = time.time()
 
         with self._lock:
-            path_value = data.get("path", "")
+            path_value = data.get("path")
+            if not path_value:
+                raise ValueError("upsert_media requires a non-empty 'path'")
             existing = self._conn.execute("SELECT id FROM media WHERE path=?",
                                           (path_value,)).fetchone()
             if existing:
@@ -181,9 +219,12 @@ class Database:
                     self._conn.execute(f"UPDATE media SET {cols} WHERE id=?",
                                        (*data.values(), media_id))
             else:
-                # `path` is already a key of `data`; listing it twice makes
-                # SQLite silently keep the first binding, so build the row once.
-                row = {"path": path_value, **{k: v for k, v in data.items() if k != "path"}}
+                # `added_at` is the moment the file entered the library, so it
+                # is stamped once on insert. Including it in the UPDATE branch
+                # made "recently added" drift on every re-index.
+                row = {"added_at": time.time(), "path": path_value,
+                       **{k: v for k, v in data.items()
+                          if k not in ("path", "added_at")}}
                 cols = ", ".join(row)
                 marks = ", ".join("?" * len(row))
                 cur = self._conn.execute(f"INSERT INTO media({cols}) VALUES({marks})",
@@ -197,12 +238,8 @@ class Database:
 
     def _write_tags(self, media_id: int, tags) -> None:
         self._conn.execute("DELETE FROM media_tags WHERE media_id=?", (media_id,))
-        if not tags:
-            self._conn.execute("DELETE FROM media_fts WHERE media_id=?", (media_id,))
-            return
-
         names: list[str] = []
-        for tag in tags:
+        for tag in tags or []:
             name, category, confidence = tag
             cur = self._conn.execute(
                 "INSERT INTO tags(name, category) VALUES(?, ?) "
@@ -219,13 +256,17 @@ class Database:
             )
             names.append(name.replace("_", " "))
 
-        self._conn.execute("DELETE FROM media_fts WHERE media_id=?", (media_id,))
+        # The FTS row always exists and always carries the filename, even when a
+        # re-index produced no tags. Dropping it made the file unfindable by
+        # name the moment its tag set emptied.
         filename = self._conn.execute("SELECT filename FROM media WHERE id=?",
                                       (media_id,)).fetchone()[0]
-        self._conn.execute(
-            "INSERT INTO media_fts(text, media_id) VALUES(?, ?)",
-            (" ".join([filename.replace("_", " ")] + names), media_id),
-        )
+        if self.has_fts:
+            self._conn.execute("DELETE FROM media_fts WHERE media_id=?", (media_id,))
+            self._conn.execute(
+                "INSERT INTO media_fts(text, media_id) VALUES(?, ?)",
+                (" ".join([filename.replace("_", " ")] + names), media_id),
+            )
 
     def get_media(self, media_id: int) -> dict | None:
         rows = self._query("SELECT * FROM media WHERE id=?", (media_id,))
@@ -268,7 +309,9 @@ class Database:
     def delete_media(self, media_id: int) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM media WHERE id=?", (media_id,))
-            self._conn.execute("DELETE FROM media_fts WHERE media_id=?", (media_id,))
+            if self.has_fts:
+                self._conn.execute("DELETE FROM media_fts WHERE media_id=?", (media_id,))
+            # Anything that pointed at this row is no longer a duplicate of it.
             self._conn.execute("UPDATE media SET duplicate_of=NULL WHERE duplicate_of=?",
                                (media_id,))
             self._conn.commit()
@@ -290,11 +333,22 @@ class Database:
 
         if query:
             like = f"%{query.lower()}%"
-            where.append(
-                "(lower(m.filename) LIKE ? OR EXISTS("
-                "  SELECT 1 FROM media_fts f WHERE f.media_id = m.id AND media_fts MATCH ?))"
-            )
-            params.extend([like, self._fts_query(query)])
+            if self.has_fts:
+                where.append(
+                    "(lower(m.filename) LIKE ? OR EXISTS("
+                    "  SELECT 1 FROM media_fts f WHERE f.media_id = m.id AND media_fts MATCH ?))"
+                )
+                params.extend([like, self._fts_query(query)])
+            else:
+                # Without the FTS mirror the tag text is not reachable by LIKE,
+                # so fall back to a join over the normalised tag tables rather
+                # than referencing a table that does not exist.
+                where.append(
+                    "(lower(m.filename) LIKE ? OR EXISTS("
+                    "  SELECT 1 FROM media_tags mt JOIN tags t ON t.id=mt.tag_id"
+                    "  WHERE mt.media_id=m.id AND lower(t.name) LIKE ?))"
+                )
+                params.extend([like, like])
 
         for tag in tags or []:
             where.append(
@@ -341,8 +395,20 @@ class Database:
 
     @staticmethod
     def _fts_query(text: str) -> str:
+        """Build a safe FTS5 MATCH expression.
+
+        Every token is quoted, so user input can never be read as FTS5 operator
+        syntax. An input with no usable token yields ``""``: an expression that
+        matches nothing, which keeps the surrounding OR-branch well-formed.
+        """
         tokens = [t for t in "".join(c if c.isalnum() else " " for c in text).split() if t]
         return " OR ".join(f'"{t}"' for t in tokens) if tokens else '""'
+
+    @staticmethod
+    def _like(prefix: str) -> str:
+        """Escape LIKE wildcards so a tag containing % or _ is a literal."""
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"{escaped}%"
 
     def autocomplete(self, prefix: str = "", limit: int = 25) -> list[dict]:
         """Tag completion ranked by usage frequency, then alphabetically."""
@@ -351,9 +417,9 @@ class Database:
             rows = self._query(
                 "SELECT t.name, t.category, COUNT(mt.media_id) AS uses "
                 "FROM tags t LEFT JOIN media_tags mt ON mt.tag_id=t.id "
-                "WHERE lower(t.name) LIKE ? "
+                "WHERE lower(t.name) LIKE ? ESCAPE '\\' "
                 "GROUP BY t.name ORDER BY uses DESC, t.name ASC LIMIT ?",
-                (f"{prefix}%", int(limit)),
+                (self._like(prefix), int(limit)),
             )
         else:
             rows = self._query(
@@ -397,8 +463,15 @@ class Database:
                 for r in rows]
 
     # -- duplicates -----------------------------------------------------
-    def duplicate_groups(self) -> list[list[dict]]:
-        """Group visually similar media using Hamming distance on perceptual hashes."""
+    def duplicate_groups(self, phash_tolerance: int = 4,
+                         dhash_tolerance: int = 6) -> list[list[dict]]:
+        """Group visually similar media by Hamming distance on perceptual hashes.
+
+        Unlike the live matcher this is a read-only audit, so it compares the
+        full 64-bit hashes and takes its tolerances from the caller instead of
+        the hardcoded 8 that used to both ignore ``max_phash_distance`` and
+        truncate the comparison to its first 32 bits.
+        """
         candidates = [dict(r) for r in self.iter_hashes()]
         buckets: dict[str, list[dict]] = {}
         for item in candidates:
@@ -415,15 +488,14 @@ class Database:
                 for right in bucket[i + 1:]:
                     if right["id"] in seen:
                         continue
-                    if _hamming(left.get("phash"), right.get("phash"), 8) <= 8:
+                    if _hamming(left.get("phash"), right.get("phash")) <= phash_tolerance \
+                            and _hamming(left.get("dhash"), right.get("dhash")) <= dhash_tolerance:
                         cluster.append(right)
                         seen.add(right["id"])
                 if len(cluster) > 1:
                     seen.add(left["id"])
-                    groups.append([self._hydrate(
-                        self._query("SELECT * FROM media WHERE id=?", (c["id"],))[0])
-                        for c in cluster])
-        return groups
+                    groups.append(cluster)
+        return [[self.get_media(c["id"]) for c in group] for group in groups]
 
     def mark_duplicate(self, media_id: int, original_id: int | None) -> None:
         self._execute("UPDATE media SET duplicate_of=?, status=? WHERE id=?",
@@ -445,7 +517,11 @@ class Database:
             "pending": scalar("SELECT COUNT(*) FROM media WHERE status='pending'"),
             "tagged": scalar("SELECT COUNT(DISTINCT media_id) FROM media_tags"),
             "tags": scalar("SELECT COUNT(*) FROM tags"),
-            "bytes": scalar("SELECT COALESCE(SUM(file_size),0) FROM media"),
+            # Counts only what the user can actually browse, so the figure
+            # matches `total`; summing every row included quarantined
+            # duplicates and failed entries.
+            "bytes": scalar("SELECT COALESCE(SUM(file_size),0) FROM media "
+                            "WHERE status='ready'"),
         }
 
     # -- queue ----------------------------------------------------------
@@ -470,14 +546,42 @@ class Database:
         return scalar_count(self, "SELECT COUNT(*) FROM queue")
 
     def requeue(self, path: str | Path, error: str = "") -> None:
+        """Record a path for a later retry, counting attempts.
+
+        This used to be a dead end: nothing ever read the ``queue`` table, so a
+        file that failed once was simply lost until the inbox was rescanned.
+        """
         self._execute(
             "INSERT INTO queue(path, added_at, tries, error) VALUES(?, ?, 1, ?) "
-            "ON CONFLICT DO NOTHING",
+            "ON CONFLICT(path) DO UPDATE SET tries = tries + 1, "
+            "error=excluded.error, added_at=excluded.added_at",
             (str(path), time.time(), error[:500]),
         )
 
+
     def clear_queue(self) -> None:
         self._execute("DELETE FROM queue")
+
+    def retry_paths(self, max_tries: int = 5) -> list[str]:
+        """Drain paths that failed on an earlier run.
+
+        Anything past ``max_tries`` is dropped so a permanently broken file
+        cannot be retried forever on every launch.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT path, tries FROM queue ORDER BY id").fetchall()
+            keep, drop = [], []
+            for row in rows:
+                (drop if row["tries"] >= max_tries else keep).append(row["path"])
+            for path in drop:
+                self._conn.execute("DELETE FROM queue WHERE path=?", (path,))
+            self._conn.execute("DELETE FROM queue")
+            self._conn.commit()
+        if drop:
+            print(f"[db] dropped {len(drop)} path(s) that failed "
+                  f"{max_tries}+ times")
+        return keep
 
 
 def scalar_count(db: Database, sql: str) -> int:
@@ -485,11 +589,12 @@ def scalar_count(db: Database, sql: str) -> int:
     return int(rows[0][0]) if rows else 0
 
 
-def _hamming(a: str | None, b: str | None, limit: int) -> int:
+def _hamming(a: str | None, b: str | None) -> int:
+    """Bit distance between two hex perceptual hashes, or 64 when incomparable."""
     if not a or not b or len(a) != len(b):
-        return 999
+        return 64
     return sum(bin(int(x, 16) ^ int(y, 16)).count("1")
-               for x, y in zip(a[:limit], b[:limit]))
+               for x, y in zip(a, b))
 
 
 def dump_json(value) -> str:

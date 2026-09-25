@@ -19,7 +19,7 @@ from pathlib import Path
 import cv2
 from PIL import Image, ImageFile, ImageOps
 
-from .config import ANIMATED_EXT, IMAGE_EXT, VIDEO_EXT, Config
+from .config import IMAGE_EXT, VIDEO_EXT, Config
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
@@ -105,11 +105,34 @@ def classify(path: str | Path) -> str | None:
 def probe_image(path: str | Path) -> MediaInfo:
     info = MediaInfo()
     with Image.open(path) as handle:
-        info.width, info.height = handle.size
-        animated = getattr(handle, "n_frames", 1)
-        info.frames = int(animated)
-        info.animated = animated > 1 or Path(path).suffix.lower() in ANIMATED_EXT
+        info.width, info.height = _oriented_size(handle)
+        info.frames = int(getattr(handle, "n_frames", 1))
+        # A static .webp is far more common than an animated one, and .gif is
+        # usually animated but not always. Trust the frame count, which is what
+        # actually decides this, and keep the extension only as a hint.
+        info.animated = info.frames > 1
     return info
+
+
+def _oriented_size(handle: Image.Image) -> tuple[int, int]:
+    """Size after EXIF rotation, which is what the user actually sees."""
+    size = handle.size
+    exif = handle.getexif()
+    if exif.get(0x0112) in (5, 6, 7, 8):     # orientations that swap w/h
+        return size[1], size[0]
+    return size
+
+
+def first_frame(handle: Image.Image) -> Image.Image:
+    """Frame 0 as RGB.
+
+    Every consumer - the perceptual hash, the tagger and the thumbnail - reads
+    frame 0. The thumbnail used to seek to frame 30 for animations, so a GIF's
+    card showed a pose that was never tagged or hashed.
+    """
+    if getattr(handle, "n_frames", 1) > 1:
+        handle.seek(0)
+    return ImageOps.exif_transpose(handle).convert("RGB")
 
 
 def probe_video(path: str | Path, ffmpeg: str | None = None) -> MediaInfo:
@@ -163,12 +186,7 @@ def make_thumbnail(path: str | Path, out_path: str | Path, size: int = 480,
 
 def _thumb_from_image(path: str | Path, out_path: Path, size: int) -> bool:
     with Image.open(path) as handle:
-        frame = 0
-        if getattr(handle, "n_frames", 1) > 1:
-            handle.seek(min(30, handle.n_frames - 1))
-            frame = handle.tell()
-        image = handle.convert("RGB")
-    image = ImageOps.exif_transpose(image)
+        image = first_frame(handle)
     image.thumbnail((size, size), Image.Resampling.LANCZOS)
     image.save(out_path, "JPEG", quality=85, optimize=True)
     return True
@@ -235,21 +253,30 @@ def _fit_square(src: str, dest: Path, size: int) -> None:
 
 
 def open_for_tagging(path: str | Path, kind: str, ffmpeg: str | None = None):
-    """Return a PIL image suitable for the tagger, extracting a video frame if needed."""
+    """Return a PIL image suitable for the tagger, extracting a video frame if needed.
+
+    Images go through :func:`first_frame` so EXIF rotation is applied. The
+    thumbnail honoured the orientation tag but the tagger and the perceptual
+    hash did not, so a rotated phone photo was indexed as landscape and
+    deduplicated against the wrong neighbours.
+    """
     if kind == "image":
-        handle = Image.open(path)
-        if getattr(handle, "n_frames", 1) > 1:
-            handle.seek(0)
-        return handle.convert("RGB")
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp_path = tmp.name
+        with Image.open(path) as handle:
+            return first_frame(handle)
+    tmp_path = None
     try:
-        if not _thumb_from_ffmpeg(path, Path(tmp_path), 1024, ffmpeg, 1.0):
-            if not _thumb_from_cv2(path, Path(tmp_path), 1024, 1.0):
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        if not _thumb_from_ffmpeg(path, tmp_path, 1024, ffmpeg, 1.0):
+            if not _thumb_from_cv2(path, tmp_path, 1024, 1.0):
                 raise RuntimeError("no video decoder available")
-        return Image.open(tmp_path).convert("RGB")
+        with Image.open(tmp_path) as handle:
+            return handle.convert("RGB")
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        # The image is fully decoded by now; on Windows the unlink would fail
+        # if any handle were still open.
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def write_json(value, path: str | Path) -> None:

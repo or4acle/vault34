@@ -51,7 +51,7 @@ class TagVocabulary:
 
     @classmethod
     def from_csv(cls, path: str | Path) -> "TagVocabulary":
-        with open(path, newline="", encoding="utf-8") as handle:
+        with open(path, newline="", encoding="utf-8-sig") as handle:
             rows = list(csv.reader(handle))
         if not rows:
             raise ValueError(f"{path} is empty")
@@ -62,9 +62,26 @@ class TagVocabulary:
         except ValueError:
             # positional fallback: tag_id, name, category, count
             name_col, cat_col = 1, 2
-        data = rows[1:]
-        names = [r[name_col].strip() for r in data]
-        categories = [CATEGORY_MAP.get(r[cat_col].strip(), "general") for r in data]
+        names: list[str] = []
+        categories: list[str] = []
+        skipped = 0
+        for row in rows[1:]:
+            # A short or blank line used to raise IndexError and take the whole
+            # vocabulary down; the real file has one such artefact and losing
+            # 9,000 labels to it is not an acceptable trade.
+            if len(row) <= max(name_col, cat_col):
+                skipped += 1
+                continue
+            name = row[name_col].strip()
+            if not name:
+                skipped += 1
+                continue
+            names.append(name)
+            categories.append(CATEGORY_MAP.get(row[cat_col].strip(), "general"))
+        if skipped:
+            print(f"[tagger] skipped {skipped} malformed row(s) in {path}")
+        if not names:
+            raise ValueError(f"{path} contains no usable tag rows")
         rating_indices = [i for i, c in enumerate(categories) if c == "rating"]
         if not rating_indices:
             raise ValueError(f"{path} has no rating rows")
@@ -161,9 +178,10 @@ class Tagger:
 
     def tag_file(self, path: str | Path, general_threshold: float = 0.35,
                  character_threshold: float = 0.85, max_tags: int = 60) -> dict:
+        from .media import first_frame
         with Image.open(path) as handle:
-            handle.seek(0)
-            return self.tag_image(handle, general_threshold, character_threshold, max_tags)
+            return self.tag_image(first_frame(handle), general_threshold,
+                                  character_threshold, max_tags)
 
     def _decode(self, probs: np.ndarray, general_threshold: float,
                 character_threshold: float, max_tags: int) -> dict:
@@ -178,14 +196,19 @@ class Tagger:
             for i in vocab.general_indices if probs[i] >= general_threshold
         ]
         general.sort(key=lambda kv: kv[1], reverse=True)
-        general = general[:max_tags]
 
         characters: list[tuple[str, float]] = [
             (vocab.names[i], float(probs[i]))
             for i in vocab.character_indices if probs[i] >= character_threshold
         ]
         characters.sort(key=lambda kv: kv[1], reverse=True)
-        characters = characters[:max_tags]
+
+        # max_tags is the size of the stored tag set, not a per-category quota.
+        # Truncating each list separately let a single image carry 2x the
+        # configured cap (120 tags at the default 60).
+        room = max(0, int(max_tags) - len(characters))
+        general = general[:room]
+        characters = characters[:max(0, int(max_tags))]
 
         general_map = dict(general)
         for name, score in characters:

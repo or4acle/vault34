@@ -82,6 +82,9 @@ class DesktopBridge:
         if kind == "inbox" and self.watcher is not None:
             self.watcher.stop()
             self.watcher.path = self.cfg.inbox_dir
+            # The library may have moved too, so the exclusion list has to be
+            # rebuilt or the watcher can start re-ingesting its own output.
+            self.watcher._exclude = [self.cfg.library_dir, self.cfg.duplicates_dir]
             self.watcher.start()
         self.pipeline.scan_inbox()
         return True
@@ -130,9 +133,8 @@ def build_tagger(cfg):
 
 def main(argv=None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
-    headless = "--headless" in argv or "--no-window" in argv
-    if "--headless" in argv:
-        argv.remove("--headless")
+    headless = any(flag in argv for flag in ("--headless", "--no-window"))
+    argv = [a for a in argv if a not in ("--headless", "--no-window")]
 
     cfg = load_config()
     print(BANNER)
@@ -150,24 +152,33 @@ def main(argv=None) -> int:
         print(f"[media] ffmpeg found: {pipeline.ffmpeg}")
     else:
         print("[media] ffmpeg not found - video thumbnails use the OpenCV fallback")
-    pipeline.start()
 
     watcher = InboxWatcher(cfg.inbox_dir, pipeline.submit,
-                           cfg.stability_checks, cfg.stability_interval)
-    watcher.start()
-    queued = pipeline.scan_inbox()
-    print(f"[pipeline] {queued} file(s) queued from the inbox")
-
+                           cfg.stability_checks, cfg.stability_interval,
+                           exclude=[cfg.library_dir, cfg.duplicates_dir])
     bridge = DesktopBridge(cfg, pipeline, watcher)
     app = create_app(cfg, db, pipeline, desktop=bridge)
+
+    # Bind the port before any ingest work starts. The previous order started
+    # the worker, the watcher and a full inbox scan first, so a second instance
+    # discovered the port was taken only after it had already begun moving
+    # files out from under the instance that actually owns them.
     try:
         server, _ = serve(cfg, app)
     except OSError as exc:
         print(f"[server] {exc}")
-        _shutdown(cfg, pipeline, watcher, None)
+        db.close()
         return 1
     url = f"http://{cfg.host}:{server.server_port}/"
     print(f"[server] listening on {url}")
+
+    pipeline.start()
+    watcher.start()
+    resumed = pipeline.resume_failures()
+    if resumed:
+        print(f"[pipeline] re-queued {resumed} file(s) that failed earlier")
+    queued = pipeline.scan_inbox()
+    print(f"[pipeline] {queued} file(s) queued from the inbox")
 
     if headless:
         print("[ui] headless mode; press Ctrl+C to stop")
@@ -177,7 +188,7 @@ def main(argv=None) -> int:
         except KeyboardInterrupt:
             print("\n[shutdown] stopping")
         finally:
-            _shutdown(cfg, pipeline, watcher, server)
+            _shutdown(db, pipeline, watcher, server)
         return 0
 
     try:
@@ -191,7 +202,7 @@ def main(argv=None) -> int:
         except KeyboardInterrupt:
             pass
         finally:
-            _shutdown(cfg, pipeline, watcher, server)
+            _shutdown(db, pipeline, watcher, server)
         return 0
 
     window = webview.create_window(
@@ -203,11 +214,12 @@ def main(argv=None) -> int:
         text_select=True,
     )
     webview.start(debug=False, private_mode=True)
-    _shutdown(cfg, pipeline, watcher, server)
+    _shutdown(db, pipeline, watcher, server)
     return 0
 
 
-def _shutdown(cfg, pipeline, watcher, server) -> None:
+def _shutdown(db, pipeline, watcher, server) -> None:
+    """Stop in an order that cannot deadlock: producer, consumer, then storage."""
     try:
         watcher.stop()
     except Exception:  # noqa: BLE001
@@ -219,6 +231,13 @@ def _shutdown(cfg, pipeline, watcher, server) -> None:
     if server is not None:
         try:
             server.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+    if db is not None:
+        # Leaving the connection open kept the -wal/-shm sidecars on disk and
+        # meant the final transaction was only flushed at interpreter exit.
+        try:
+            db.close()
         except Exception:  # noqa: BLE001
             pass
     print("[shutdown] done")

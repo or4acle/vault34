@@ -21,6 +21,8 @@ const state = {
   acIndex: -1,
   acItems: [],
   searchTimer: null,
+  searchSeq: 0,
+  wasBusy: false,
 };
 
 /* ---------------- rendering ---------------- */
@@ -52,7 +54,7 @@ function card(item) {
     <div class="thumb">
       <img loading="lazy" src="${item.thumb_url}" alt="${escapeHtml(item.filename)}">
       ${item.status === 'duplicate' ? '<span class="badge dup">duplicate</span>' : ''}
-      <span class="badge">${escapeHtml(kind)}</span>
+      <span class="badge kind">${escapeHtml(kind)}</span>
     </div>
     <div class="meta">
       <div class="name" title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</div>
@@ -112,14 +114,26 @@ function queryString(extra = {}) {
 }
 
 async function loadLibrary(append = false) {
+  // Every keystroke fires a request. Without a sequence check a slow earlier
+  // response could land after a newer one and repaint the grid with stale
+  // results for a query the user has already moved on from.
+  const seq = ++state.searchSeq;
   if (!append) { state.offset = 0; $('#grid').innerHTML = ''; }
-  const data = await api('/api/search?' + queryString());
+  let data;
+  try {
+    data = await api('/api/search?' + queryString());
+  } catch (err) {
+    if (seq === state.searchSeq) $('#count').textContent = `search failed: ${err.message}`;
+    return;
+  }
+  if (seq !== state.searchSeq) return;   // a newer search already won
+
   state.total = data.total;
   const grid = $('#grid');
   data.items.forEach((item) => grid.appendChild(card(item)));
 
   $('#count').textContent = data.total
-    ? `${data.items.length + (append ? state.offset : 0)} of ${data.total}`
+    ? `${grid.children.length} of ${data.total}`
     : '0 items';
   $('#more').hidden = grid.children.length >= data.total;
 
@@ -149,14 +163,12 @@ async function loadDuplicates() {
   data.groups.forEach((group) => {
     const wrap = document.createElement('div');
     wrap.className = 'dupgroup';
-    wrap.style.display = 'contents';
-    const title = document.createElement('div');
-    title.className = 'dupgroup';
-    title.innerHTML = `<h3>${group.length} visually similar files</h3>`;
+    const title = document.createElement('h3');
+    title.textContent = `${group.length} visually similar files`;
     const holder = document.createElement('div');
     holder.className = 'grid';
     group.forEach((item) => holder.appendChild(card(item)));
-    wrap.replaceChildren(title, holder);
+    wrap.append(title, holder);
     grid.appendChild(wrap);
   });
 }
@@ -204,7 +216,7 @@ async function runAutocomplete(term) {
   items.forEach((t, i) => {
     const row = document.createElement('div');
     row.innerHTML = `<span>${escapeHtml(t.name.replace(/_/g, ' '))}</span>
-                     <small>${t.category} · ${t.uses}</small>`;
+                     <small>${escapeHtml(t.category)} · ${t.uses}</small>`;
     row.addEventListener('mousedown', (e) => { e.preventDefault(); pick(i); });
     box.appendChild(row);
   });
@@ -233,7 +245,22 @@ function pick(i) {
 
 async function openLightbox(id) {
   const item = await api(`/api/media/${id}`);
-  $('#lb-img').src = item.media_url;
+  // A video served into an <img> renders as a broken image, so the two media
+  // kinds swap elements rather than sharing one src.
+  const img = $('#lb-img');
+  const video = $('#lb-video');
+  if (item.kind === 'video') {
+    img.hidden = true;
+    img.removeAttribute('src');
+    video.hidden = false;
+    video.src = item.media_url;
+  } else {
+    video.hidden = true;
+    video.pause();
+    video.removeAttribute('src');
+    img.hidden = false;
+    img.src = item.media_url;
+  }
   $('#lb-title').textContent = item.filename;
   $('#lb-meta').textContent = [
     `${item.width}×${item.height}`,
@@ -253,18 +280,45 @@ async function openLightbox(id) {
   $('#lb-reveal').onclick = () => reveal(id);
 }
 
-function closeLightbox() { $('#lightbox').hidden = true; $('#lb-img').src = ''; }
+function closeLightbox() {
+  $('#lightbox').hidden = true;
+  const video = $('#lb-video');
+  video.pause();
+  video.removeAttribute('src');
+  $('#lb-img').removeAttribute('src');
+}
+
+/* The JS bridge is injected only after pywebview fires `pywebviewready`.
+   Reading window.pywebview before that silently fell through to the HTTP
+   fallback, so "Show in folder" opened the wrong handler on first click. */
+const nativeApi = new Promise((resolve) => {
+  const grab = () => (window.pywebview && window.pywebview.api) || null;
+  if (grab()) return resolve(window.pywebview.api);
+  window.addEventListener('pywebviewready', () => resolve(grab()), { once: true });
+});
 
 async function reveal(id) {
-  const bridge = window.pywebview?.api;
-  if (bridge?.reveveal) { await bridge.reveal(id); return; }
-  await api(`/api/bridge/reveal?id=${id}`).catch(() => {});
+  const bridge = await Promise.race([
+    nativeApi, new Promise((r) => setTimeout(() => r(null), 1500)),
+  ]);
+  if (bridge && bridge.reveal) { await bridge.reveal(id); return; }
+  // POST, not GET: a cross-origin GET is a "simple request" that a hostile
+  // page can trigger from an <img> tag. POST forces a CORS preflight the
+  // server refuses, so the request is never actually sent.
+  await api(`/api/bridge/reveal?id=${id}`, { method: 'POST' }).catch(() => {});
 }
+
 
 /* ---------------- status ---------------- */
 
 async function refreshStats() {
-  const s = await api('/api/stats');
+  let s;
+  try {
+    s = await api('/api/stats');
+  } catch (err) {
+    setTimeout(refreshStats, 5000);   // the server may be restarting
+    return;
+  }
   $('#stats').innerHTML = `
     <div>media <b>${s.total}</b></div>
     <div>images <b>${s.images}</b></div>
@@ -282,7 +336,13 @@ async function refreshStats() {
     $('#progress-fill').style.width = `${Math.min(100, p.completed % 100)}%`;
     $('#progress-text').textContent = `${p.phase} ${p.current || ''}`;
   }
-  if (busy) setTimeout(refreshStats, 1200);
+  // Poll while work is happening, and once more on the transition to idle so
+  // the counters settle. Stopping at the first idle reading left the sidebar
+  // showing totals from before the last batch finished, permanently.
+  if (busy || state.wasBusy) {
+    state.wasBusy = busy;
+    setTimeout(refreshStats, 1200);
+  }
 }
 
 /* ---------------- wiring ---------------- */
@@ -331,7 +391,7 @@ function init() {
     e.target.disabled = true;
     try { await api('/api/scan', { method: 'POST' }); } finally { setTimeout(() => { e.target.disabled = false; }, 1200); }
   });
-  $('#open-inbox').addEventListener('click', () => api('/api/bridge/reveal_folder?which=inbox').catch(() => {}));
+  $('#open-inbox').addEventListener('click', () => api('/api/bridge/reveal_folder?which=inbox', { method: 'POST' }).catch(() => {}));
   $('#more').addEventListener('click', () => {
     state.offset += state.limit;
     loadLibrary(true);

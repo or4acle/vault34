@@ -442,7 +442,7 @@ Contributions are welcome. A few things that will help:
 <!-- LICENSE -->
 ## License
 
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+Distributed under the MIT License. See `LICENSE` for more information.
 
 The bundled tagger, [WD-14 v1.4 Moat](https://huggingface.co/SmilingWolf/wd-v1-4-moat-tagger-v2),
 is MIT licensed and is downloaded separately by `setup_assets.py`, not vendored into
@@ -479,5 +479,5 @@ this repository.
 [issues-shield]: https://img.shields.io/github/issues/or4acle/vault34.svg?style=for-the-badge
 [issues-url]: https://github.com/or4acle/vault34/issues
 [license-shield]: https://img.shields.io/github/license/or4acle/vault34.svg?style=for-the-badge
-[license-url]: https://github.com/or4acle/vault34/blob/main/LICENSE.txt
+[license-url]: https://github.com/or4acle/vault34/blob/main/LICENSE e4e33e1 (Harden indexing, stop losing work on shutdown, and lock the API to loopback)
 [product-screenshot]: images/screenshot.png

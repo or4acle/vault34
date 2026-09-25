@@ -7,25 +7,121 @@ arbitrary files off the machine.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import threading
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import (Flask, Response, abort, jsonify, request, send_file,
                    send_from_directory)
+from werkzeug.exceptions import BadRequest, HTTPException
 
-from .config import Config
+from .config import IMAGE_EXT, VIDEO_EXT, Config
 from .db import Database
 from .media import ffmpeg_version
 from .pipeline import Pipeline
+
+# Only these may be driven from a URL. Resolving any public attribute of the
+# bridge meant a new method added for the desktop was automatically exposed to
+# anything that could reach the loopback port.
+BRIDGE_METHODS = frozenset({"reveal", "reveal_folder", "rescan", "set_folder", "stats"})
+
+# Bridge calls that touch the OS or rescan the inbox, so they must not be
+# triggerable by a third-party page that happens to know the port. These require
+# POST: a cross-origin GET is a "simple request" the browser will send without
+# any preflight, so <img src="/api/bridge/reveal_folder?which=inbox"> on a
+# hostile page would otherwise open the user's folders. POST triggers a CORS
+# preflight that _local_only refuses, and the browser never sends the request.
+BRIDGE_MUTATIONS = frozenset({"reveal", "reveal_folder", "set_folder", "rescan"})
+
+
+def _coerce(value: str, annotation):
+    """Turn a query-string value into the type the callee declared."""
+    if annotation is int:
+        try:
+            return int(value)
+        except ValueError:
+            raise BadRequest(f"expected an integer, got {value!r}")
+    if annotation is float:
+        try:
+            return float(value)
+        except ValueError:
+            raise BadRequest(f"expected a number, got {value!r}")
+    if annotation is bool:
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value
+
+
+def _int_arg(name: str, default: int, low: int, high: int) -> int:
+    """Read a bounded integer query parameter.
+
+    ``int()`` straight on ``request.args`` raised ValueError, which Flask turns
+    into an HTML 500. A malformed query should be a 400 in the same JSON shape
+    as every other response, and a negative limit meant "unlimited" to SQLite.
+    """
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            raise BadRequest(f"'{name}' must be an integer, got {raw!r}")
+    return max(low, min(high, value))
+
+
+def _float_arg(name: str, default: float, low: float, high: float) -> float:
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            raise BadRequest(f"'{name}' must be a number, got {raw!r}")
+    return max(low, min(high, value))
 
 
 def create_app(cfg: Config, db: Database, pipeline: Pipeline,
                desktop=None) -> Flask:
     app = Flask(__name__, static_folder=None)
-    app.config["JSON_SORT_KEYS"] = False
+    # Flask 2.3 dropped the JSON_SORT_KEYS config key in favour of this
+    # attribute, so the old assignment was silently ignored.
+    app.json.sort_keys = False
+
+    @app.errorhandler(HTTPException)
+    def _http_error(exc: HTTPException):
+        """Errors are JSON, not Flask's default HTML page.
+
+        The frontend fetches these endpoints and does response.json(); an HTML
+        error body would surface as an opaque "Unexpected token <" in the
+        console instead of the message we deliberately wrote.
+        """
+        return jsonify({"error": exc.description, "status": exc.code}), exc.code
+
+    @app.before_request
+    def _local_only():
+        """Reject requests that did not come from this app on this machine.
+
+        The API is unauthenticated and bound to loopback, so without this any
+        page the user visits could POST to /api/scan or drive the bridge with
+        an <img> tag. A cross-origin request either omits Host or carries one
+        that is not ours; the Origin check additionally covers the simple
+        GET-based bridge calls.
+        """
+        host = request.host.split(":")[0].strip("[]").lower()
+        allowed = {cfg.host, "127.0.0.1", "localhost", "::1"}
+        if host not in allowed:
+            return jsonify({"error": "bad host"}), 403
+        origin = request.headers.get("Origin")
+        if origin:
+            parsed = urlsplit(origin)
+            if parsed.hostname not in allowed:
+                return jsonify({"error": "cross-origin request refused"}), 403
+        return None
 
     def safe_media_file(media_id: int, what: str):
         item = db.get_media(media_id)
@@ -70,6 +166,10 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
         stats["progress"] = pipeline.progress.snapshot()
         return jsonify(stats)
 
+    @functools.lru_cache(maxsize=None)
+    def _ffmpeg_version_cached(value: str | None) -> str | None:
+        return ffmpeg_version(value)
+
     @app.get("/api/status")
     def api_status():
         return jsonify({
@@ -83,8 +183,12 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
             "tagger_ready": bool(pipeline.tagger and pipeline.tagger.ready),
             "providers": getattr(pipeline.tagger, "providers", []),
             "ffmpeg": pipeline.ffmpeg,
-            "ffmpeg_version": ffmpeg_version(pipeline.ffmpeg),
+            # Shelling out to `ffmpeg -version` took up to 10s and ran on every
+            # poll of this endpoint; the answer cannot change while the app is
+            # up, so it is computed once per ffmpeg path.
+            "ffmpeg_version": _ffmpeg_version_cached(pipeline.ffmpeg),
             "video_backend": "opencv",
+            "has_fts": db.has_fts,
             "thresholds": {
                 "general": cfg.general_threshold,
                 "character": cfg.character_threshold,
@@ -103,9 +207,9 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
             query=request.args.get("q", "").strip(),
             tags=tags,
             kinds=kinds,
-            limit=min(int(request.args.get("limit", 60)), 500),
-            offset=int(request.args.get("offset", 0)),
-            min_confidence=float(request.args.get("min_confidence", 0) or 0),
+            limit=_int_arg("limit", 60, 1, 500),
+            offset=_int_arg("offset", 0, 0, 1_000_000),
+            min_confidence=_float_arg("min_confidence", 0.0, 0.0, 1.0),
             sort=request.args.get("sort", "recent"),
         )
         result["query"] = {"tags": tags, "kinds": kinds}
@@ -116,11 +220,11 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
     @app.get("/api/tags/autocomplete")
     def api_autocomplete():
         return jsonify(db.autocomplete(
-            request.args.get("q", ""), int(request.args.get("limit", 25))))
+            request.args.get("q", ""), _int_arg("limit", 25, 1, 200)))
 
     @app.get("/api/tags/top")
     def api_top_tags():
-        return jsonify(db.top_tags(int(request.args.get("limit", 40)),
+        return jsonify(db.top_tags(_int_arg("limit", 40, 1, 500),
                                    request.args.get("category") or None))
 
     @app.get("/api/tags/related")
@@ -128,7 +232,7 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
         name = request.args.get("name", "")
         if not name:
             return jsonify([])
-        return jsonify(db.similar_tags(name, int(request.args.get("limit", 12))))
+        return jsonify(db.similar_tags(name, _int_arg("limit", 12, 1, 200)))
 
     def serialize(item: dict) -> dict:
         """Add the derived fields every client needs.
@@ -177,15 +281,71 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
         return jsonify({"status": "queued", "found": found,
                         "queue": pipeline.pending})
 
+    def _sanitise_folder(raw: str) -> Path:
+        """Resolve a client-supplied folder and refuse anything out of bounds.
+
+        Ingest *moves* files into the library, so an unvalidated path let any
+        request hand the pipeline ``C:\\`` and have the app relocate the user's
+        entire disk. Only the inbox and the library are accepted, and both are
+        compared after symlink resolution.
+        """
+        try:
+            target = Path(raw).expanduser().resolve()
+        except (OSError, ValueError):
+            raise BadRequest("unusable folder path")
+        roots = [cfg.inbox_dir.resolve(), cfg.library_dir.resolve()]
+        if not any(target == root or target.is_relative_to(root) for root in roots):
+            raise BadRequest(
+                f"folder must be inside the inbox or library, not {target}")
+        return target
+
     @app.post("/api/ingest")
     def api_ingest():
         payload = request.get_json(silent=True) or {}
         folder = payload.get("folder")
         if folder:
-            pipeline.submit_many(sorted(Path(folder).rglob("*")))
-        else:
-            pipeline.scan_inbox()
-        return jsonify({"status": "queued", "queue": pipeline.pending})
+            target = _sanitise_folder(str(folder))
+            media = [p for p in sorted(target.rglob("*"))
+                     if p.is_file() and p.suffix.lower() in (IMAGE_EXT | VIDEO_EXT)]
+            pipeline.submit_many(media)
+            return jsonify({"status": "queued", "found": len(media),
+                            "queue": pipeline.pending})
+        found = pipeline.scan_inbox()
+        return jsonify({"status": "queued", "found": found,
+                        "queue": pipeline.pending})
+
+    @app.delete("/api/media/<int:media_id>")
+    def api_delete(media_id: int):
+        """Forget an entry, optionally deleting the file it points at.
+
+        Only reachable for rows inside the library or the duplicates folder, so
+        a malformed database entry cannot be turned into an arbitrary delete.
+        """
+        item = db.get_media(media_id)
+        if not item:
+            abort(404)
+        path = Path(item["path"])
+        try:
+            managed = path.resolve().is_relative_to(
+                cfg.library_dir.resolve()) or path.resolve().is_relative_to(
+                cfg.duplicates_dir.resolve())
+        except OSError:
+            managed = False
+        if not managed:
+            abort(400, "refusing to touch a file outside the library")
+        if request.args.get("delete_file") in {"1", "true", "yes"}:
+            # Unlink first: if the filesystem refuses, the caller keeps a row
+            # pointing at a file that still exists, which is recoverable.
+            # Deleting the row first would lose the only handle on that file.
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                return jsonify({"status": "delete_failed",
+                                "file_deleted": False, "error": str(exc)}), 500
+            db.delete_media(media_id)
+            return jsonify({"status": "deleted", "file_deleted": True})
+        db.delete_media(media_id)
+        return jsonify({"status": "removed_from_index", "file_deleted": False})
 
     # -- desktop bridge -------------------------------------------------
     def bridge_json(payload, status: int = 200) -> Response:
@@ -194,15 +354,23 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
         return Response(json.dumps(payload, default=str), status=status,
                         mimetype="application/json")
 
-    @app.get("/api/bridge/<name>")
+    @app.route("/api/bridge/<name>", methods=["GET", "POST"])
     def api_bridge(name: str):
         """Call a DesktopBridge method from the web UI.
 
         The browser has no pywebview bridge, so the UI falls back to this route.
         Arguments come from the query string, matched by parameter name and then
         filled positionally, so ``?id=7`` can drive a ``media_id`` parameter.
+        Values are coerced to the annotation the method declares, because a
+        query string only ever yields text.
+
+        Methods in BRIDGE_MUTATIONS must arrive as POST; see the note there.
         """
-        if desktop is None or name.startswith("_"):
+        if name in BRIDGE_MUTATIONS and request.method != "POST":
+            # Checked before the bridge is even resolved so the guarantee holds
+            # regardless of whether a desktop bridge is attached.
+            return jsonify({"error": f"{name} requires POST"}), 405
+        if desktop is None or name not in BRIDGE_METHODS:
             abort(404)
         method = getattr(desktop, name, None)
         if not callable(method):
@@ -218,11 +386,11 @@ def create_app(cfg: Config, db: Database, pipeline: Pipeline,
         kwargs: dict = {}
         for param in params:
             if param.name in supplied:
-                kwargs[param.name] = supplied.pop(param.name)
+                kwargs[param.name] = _coerce(supplied.pop(param.name), param.annotation)
             elif supplied:
                 # e.g. `?id=7` for a parameter named `media_id`
                 key = next(iter(supplied))
-                kwargs[param.name] = supplied.pop(key)
+                kwargs[param.name] = _coerce(supplied.pop(key), param.annotation)
             elif param.default is param.empty:
                 abort(400, f"missing argument '{param.name}'")
         if supplied:

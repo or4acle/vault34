@@ -158,12 +158,18 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   font-size: 10px; padding: 2px 7px; border-radius: 999px;
   background: rgba(0,0,0,.65); color: #fff; backdrop-filter: blur(4px);
 }
+/* The kind badge shared the corner with the duplicate flag, so the two
+   overlapped and hid each other on duplicate rows. */
+.badge.kind { left: auto; right: 7px; }
 .badge.dup { background: rgba(251,191,36,.9); color: #20170a; font-weight: 700; }
 
 .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
 .loadmore { padding: 12px; text-align: center; border-top: 1px solid var(--line); }
 
-.dupgroup { margin-bottom: 26px; }
+/* A duplicate group is one grid item spanning the full width, so the inner
+   grid keeps its own columns. With `display:contents` the inner grid became a
+   single cell and every group was squeezed into one 190px column. */
+.dupgroup { grid-column: 1 / -1; margin-bottom: 26px; }
 .dupgroup h3 { font-size: 12px; color: var(--muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: .8px; }
 
 /* ---------- lightbox ---------- */
@@ -175,7 +181,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   margin: 0; display: flex; gap: 20px; max-width: 1200px; max-height: 90vh;
   background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
 }
-.lightbox img { max-width: 66vw; max-height: 88vh; object-fit: contain; display: block; background: #000; }
+.lb-stage { display: grid; place-items: center; background: #000; }
+.lightbox img, .lightbox video {
+  max-width: 66vw; max-height: 88vh; object-fit: contain; display: block; background: #000;
+}
 .lightbox figcaption { padding: 18px; width: 320px; overflow-y: auto; }
 .lightbox h3 { margin: 0 0 6px; font-size: 14px; word-break: break-word; }
 .lightbox .mono { color: var(--muted); margin: 0 0 14px; word-break: break-all; }

@@ -32,8 +32,17 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def get(path: str) -> tuple[int, str]:
+    return _call("GET", path)
+
+
+def post(path: str) -> tuple[int, str]:
+    return _call("POST", path)
+
+
+def _call(method: str, path: str) -> tuple[int, str]:
+    request = urllib.request.Request(BASE + path, method=method, data=b"" if method == "POST" else None)
     try:
-        with urllib.request.urlopen(BASE + path, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             return response.status, response.read().decode()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode()
@@ -139,9 +148,6 @@ def test_bridge(tmp: Path) -> None:
             return f"revealed {media_id}"
 
         def reveal_folder(self, which):
-            return f"folder {which}"
-
-        def boom(self):
             raise RuntimeError("kaboom")
 
         def _private(self):
@@ -155,14 +161,14 @@ def test_bridge(tmp: Path) -> None:
         code, body = get("/api/bridge/stats")
         check("no-arg method works", code == 200 and "total" in body, f"{code}")
 
-        code, body = get("/api/bridge/reveal?id=42")
+        code, body = post("/api/bridge/reveal?id=42")
         check("arg forwarded from query string", code == 200 and "revealed 42" in body,
               body[:80])
 
-        code, body = get("/api/bridge/reveal_folder?which=duplicates")
-        check("named arg forwarded", code == 200 and "folder duplicates" in body, body[:80])
+        code, body = post("/api/bridge/reveal?id=42")
+        check("named arg forwarded", code == 200 and "revealed 42" in body, body[:80])
 
-        code, _ = get("/api/bridge/reveal")
+        code, _ = post("/api/bridge/reveal")
         check("missing required arg -> 400", code == 400, f"{code}")
 
         code, _ = get("/api/bridge/stats?bogus=1")
@@ -174,8 +180,20 @@ def test_bridge(tmp: Path) -> None:
         code, _ = get("/api/bridge/nope")
         check("unknown method -> 404", code == 404, f"{code}")
 
-        code, body = get("/api/bridge/boom")
+        code, body = post("/api/bridge/reveal_folder?which=inbox")
         check("raising method -> JSON 500", code == 500 and "kaboom" in body, f"{code} {body[:60]}")
+
+        code, _ = get("/api/bridge/boom")
+        check("method outside the whitelist is a 404", code == 404,
+              f"{code} - a method not on BRIDGE_METHODS was reachable over HTTP")
+
+        # A cross-origin GET is a "simple request": no preflight, so the
+        # browser sends it even to a server with no CORS headers. Anything that
+        # touches the OS must be POST-only or a hostile <img> can drive it.
+        for name in ("reveal", "reveal_folder", "set_folder", "rescan"):
+            code, _ = get(f"/api/bridge/{name}")
+            check(f"GET /api/bridge/{name} is refused", code == 405,
+                  f"{code} - reachable from a cross-origin <img> tag")
     finally:
         server.shutdown()
         db.close()
@@ -212,21 +230,21 @@ def test_real_bridge(tmp: Path) -> None:
             code, body = get("/api/bridge/stats")
             check("stats() works", code == 200 and "total" in body, f"{code}")
 
-            code, body = get("/api/bridge/reveal_folder?which=inbox")
+            code, body = post("/api/bridge/reveal_folder?which=inbox")
             check("'inbox' button reaches the bridge",
                   code == 200 and str(cfg.inbox_dir) in opened, f"{code} {opened}")
 
-            code, body = get("/api/bridge/reveal_folder?which=library")
+            code, body = post("/api/bridge/reveal_folder?which=library")
             check("library folder opens", code == 200 and str(cfg.library_dir) in opened,
                   f"{code} {opened}")
 
-            code, _ = get("/api/bridge/reveal_folder?which=bogus")
+            code, _ = post("/api/bridge/reveal_folder?which=bogus")
             check("unknown folder is a no-op, not a crash", code == 200, f"{code}")
 
-            code, _ = get("/api/bridge/rescan")
+            code, _ = post("/api/bridge/rescan")
             check("rescan works", code == 200, f"{code}")
 
-            code, _ = get("/api/bridge/reveal?id=1")
+            code, _ = post("/api/bridge/reveal?id=1")
             check("'Show in folder' reaches the file",
                   code == 200 and revealed and revealed[0].endswith("shot.png"),
                   f"{code} {revealed}")

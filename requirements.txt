@@ -8,7 +8,8 @@ onnxruntime==1.28.0        # CPU by default; add onnxruntime-gpu for CUDA
 numpy==2.5.1
 
 # --- media decoding / thumbnails ---------------------------------------------
-pillow==12.3.0             # images, GIFs, phash/dhash, thumbnails
+pillow==12.3.0             # images, GIFs, thumbnails
+ImageHash==4.3.2           # phash/dhash for perceptual duplicate detection
 opencv-python-headless==5.0.0.93   # video probe + frame extraction fallback
 
 # --- filesystem watching ------------------------------------------------------
